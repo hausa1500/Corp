@@ -1,0 +1,1 @@
+{"agent":{"command":"codex","args":["exec","--skip-git-repo-check","-C","{repo}","-"]},"repos":{"SEU_USUARIO/SEU_REPOSITORIO":{"path":"C:\\\\SEU_CAMINHO\\\\SEU_REPOSITORIO","branch":"SUA_BRANCH"}}}
