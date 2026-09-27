@@ -1,8 +1,9 @@
 importScripts("broker-protocol.js");
 
-const UC_LICENSE_API_URL ="https://hfxigagycrchhhzytgli.supabase.co/functions/v1/uc-license-api";
+const HAPPY_LICENSE_API_URL ="https://happy-little101.lovable.app/api/public/v1/licenses";
+const HAPPY_LICENSE_PRODUCT ="browser-extension-core";
+const UC_LICENSE_AUX_API_URL ="https://hfxigagycrchhhzytgli.supabase.co/functions/v1/uc-license-api";
 const UC_RUNTIME_LEASE_KEY ="unstoppableRuntimeLeaseV2100";
-const UC_RUNTIME_LEASE_TTL_SKEW_MS = 45000;
 const UC_DEVICE_DB ="unstoppableDeviceSecurityV2100";
 const UC_DEVICE_STORE ="keys";
 const UC_DEVICE_KEY_ID ="primary";
@@ -70,7 +71,7 @@ if (typeof current[key] ==="undefined") missing[key] = value;
 if (Object.keys(missing).length) await chrome.storage.sync.set(missing);
 });
 
-const getConfig = async () => ({...(await chrome.storage.sync.get(DEFAULTS)),licenseApiUrl:UC_LICENSE_API_URL});
+const getConfig = async () => ({...(await chrome.storage.sync.get(DEFAULTS)),licenseApiUrl:HAPPY_LICENSE_API_URL});
 const normalize = url => String(url ||"").replace(/\/+$/,"");
 
 const GITHUB_AUTH_KEY ="unstoppableGithubAuthV190";
@@ -943,7 +944,7 @@ await chrome.storage.sync.set({githubOAuthClientId:clean});
 const current=(await chrome.storage.session.get(GITHUB_OAUTH_SETUP_KEY))[GITHUB_OAUTH_SETUP_KEY] || {};
 await chrome.storage.session.set({[GITHUB_OAUTH_SETUP_KEY]:{...current,stage:"complete",clientId:clean,deviceFlowEnabled:!!meta.deviceFlowEnabled,completedAt:Date.now()}});
 const config=await getConfig();
-const publish=await licenseRequest(config,"set_public_config",{github_oauth_client_id:clean}).catch(()=>null);
+const publish=await legacyLicenseAuxRequest(config,"set_public_config",{github_oauth_client_id:clean}).catch(()=>null);
 return {ok:true,clientId:clean,published:!!publish?.ok,publicConfigError:publish?.ok?null:(publish?.error || null)};
 }
 
@@ -1045,25 +1046,70 @@ await chrome.storage.local.set({[INSTALL_ID_KEY]:id});
 return id;
 }
 
-async function licenseRequest(config, action, extra={}, context={}) {
-const endpoint=UC_LICENSE_API_URL;
-const installId = await getInstallId();
-const stored = await readLicenseStorage(context);
-const licenseKey = String(extra.license_key ?? stored.key ??"").trim();
-const integrity = await packageIntegritySnapshot().catch(error=>({version:chrome.runtime.getManifest().version,hashes:{},digest:null,failures:[{error:String(error)}]}));
+function normalizeHappyLicenseResult(data,httpStatus) {
+const payload=data && typeof data==="object" && !Array.isArray(data)?data:{};
+const status=String(payload.status||"invalid_response");
+const active=httpStatus>=200 && httpStatus<300 && payload.valid===true && status==="active";
+const errors={
+invalid:"INVALID_LICENSE",
+device_mismatch:"DEVICE_MISMATCH",
+expired:"LICENSE_EXPIRED",
+revoked:"LICENSE_REVOKED",
+rate_limited:"TOO_MANY_ATTEMPTS",
+invalid_request:"INVALID_LICENSE_REQUEST",
+device_limit_reached:"ACTIVATION_LIMIT_REACHED",
+deactivated:"LICENSE_DEACTIVATED",
+unavailable:"LICENSE_PROVIDER_UNAVAILABLE"
+};
+const result={...payload,ok:active,active,status,httpStatus,provider:"happy-little101"};
+if(active){
+result.role="customer";
+result.capabilities=licenseCapabilities(result.role);
+result.lifetime=!payload.expiresAt;
+result.entitlement_version=chrome.runtime.getManifest().version;
+}else{
+result.error=errors[status]||(!httpStatus?"LICENSE_NETWORK_ERROR":`LICENSE_PROVIDER_${status.toUpperCase()}`);
+}
+return result;
+}
+
+async function happyLicenseRequest(operation,licenseKey,context={}) {
+const stored=await readLicenseStorage(context);
+const clean=String(licenseKey??stored.key??"").trim();
+if(!clean) return {ok:false,active:false,status:"invalid_request",error:"LICENSE_REQUIRED"};
+try{
+const deviceIdentifier=await getInstallId();
+const response=await fetch(HAPPY_LICENSE_API_URL,{
+method:"POST",
+headers:{"Content-Type":"application/json","Accept":"application/json"},
+cache:"no-store",
+body:JSON.stringify({operation,licenseKey:clean,productIdentifier:HAPPY_LICENSE_PRODUCT,deviceIdentifier})
+});
+const data=await response.json().catch(()=>null);
+return normalizeHappyLicenseResult(data,response.status);
+}catch(error){
+return {ok:false,active:false,status:"network_error",error:"LICENSE_NETWORK_ERROR",detail:String(error)};
+}
+}
+
+async function legacyLicenseAuxRequest(config,action,extra={},context={}) {
+if(!["usage","set_public_config"].includes(action)) return {ok:false,error:"LEGACY_LICENSE_ACTION_DISABLED"};
+const installId=await getInstallId();
+const stored=await readLicenseStorage(context);
+const licenseKey=String(extra.license_key??stored.key??"").trim();
+const integrity=await packageIntegritySnapshot().catch(error=>({version:chrome.runtime.getManifest().version,hashes:{},digest:null,failures:[{error:String(error)}]}));
 const version=chrome.runtime.getManifest().version;
 let proofBundle={};
 try{proofBundle=await ucDeviceProof(action,installId,version);}catch(error){return {ok:false,error:"DEVICE_PROOF_UNAVAILABLE",detail:String(error)};}
-try {
-const response = await fetch(endpoint, {
+try{
+const response=await fetch(UC_LICENSE_AUX_API_URL,{
 method:"POST",
 headers:{"Content-Type":"application/json"},
 body:JSON.stringify({action,install_id:installId,extension_version:version,license_key:licenseKey,integrity_hashes:integrity.hashes,integrity_digest:integrity.digest,integrity_failures:integrity.failures,...proofBundle,...extra})
 });
-const data = await response.json().catch(()=>({}));
-if(data?.error==="EXTENSION_INTEGRITY_MISMATCH" || data?.error==="EXTENSION_INTEGRITY_INCOMPLETE") await setSecurityLock({reason:data.error,mismatches:data.mismatches||[],missing:data.missing||[]});
+const data=await response.json().catch(()=>({}));
 return {httpStatus:response.status,...data};
-} catch (error) {
+}catch(error){
 return {ok:false,error:"LICENSE_NETWORK_ERROR",detail:String(error)};
 }
 }
@@ -1077,53 +1123,30 @@ return {name,area:chrome.storage.session,value:data[name]||null};
 const data=await chrome.storage.session.get(UC_RUNTIME_LEASE_KEY);
 return {name:UC_RUNTIME_LEASE_KEY,area:chrome.storage.session,value:data[UC_RUNTIME_LEASE_KEY]||null};
 }
-async function persistRuntimeLease(context,result){
-const token=String(result?.runtime_lease||"").trim();
-const expiresAt=Date.parse(String(result?.runtime_lease_expires_at||""))||0;
-if(!token||!expiresAt) return null;
-const store=await runtimeLeaseStorage(context);
-const value={token,expiresAt,issuedAt:Date.now(),version:chrome.runtime.getManifest().version};
-await store.area.set({[store.name]:value});
-return value;
-}
 async function clearRuntimeLease(context={}){
 const store=await runtimeLeaseStorage(context);
 await store.area.remove(store.name);
 }
-async function getRuntimeLease(context={}){
-const store=await runtimeLeaseStorage(context);
-const lease=store.value;
-if(!lease?.token || Number(lease.expiresAt||0)<=Date.now()+UC_RUNTIME_LEASE_TTL_SKEW_MS) return null;
-return lease;
-}
 async function ensureRuntimeLease(config,context={},serverValidate=false){
-const status=await getLicenseStatus(config,{force:false,context});
+const status=await getLicenseStatus(config,{force:serverValidate,context});
 if(!status?.ok||!status?.active) return {ok:false,error:status?.error||"LICENSE_REQUIRED"};
-let lease=await getRuntimeLease(context);
-if(!lease){
-const issued=await licenseRequest(config,"lease",{},context);
-if(!issued?.ok||!issued?.runtime_lease) return {ok:false,error:issued?.error||"RUNTIME_LEASE_REQUIRED"};
-lease=await persistRuntimeLease(context,issued);
-}
-if(serverValidate){
-const validated=await licenseRequest(config,"validate_lease",{runtime_lease:lease?.token||""},context);
-if(!validated?.ok){
-await clearRuntimeLease(context);
-return {ok:false,error:validated?.error||"RUNTIME_LEASE_INVALID"};
-}
-}
-return {ok:true,license:status,lease};
+return {ok:true,license:status};
 }
 
 async function activateLicense(config, key, context={}) {
 const clean = String(key ||"").trim();
-const result = await licenseRequest(config,"activate",{license_key:clean},context);
-if (result?.ok && result?.active) {
+let result=await happyLicenseRequest("check",clean,context);
+if(!result?.ok && result?.status==="device_mismatch"){
+const activated=await happyLicenseRequest("activate",clean,context);
+if(!activated?.ok||!activated?.active) return activated;
+result=await happyLicenseRequest("check",clean,context);
+if(!result?.ok||!result?.active) return result;
+}
+if(result?.ok && result?.active){
 await clearSecurityLock();
 result.capabilities=result.capabilities||licenseCapabilities(result.role);
-await syncGithubOAuthClientIdFromLicense(result);
 await persistLicenseStorage(context,clean,result);
-await persistRuntimeLease(context,result).catch(()=>null);
+await clearRuntimeLease(context);
 }
 return result;
 }
@@ -1134,14 +1157,13 @@ const key = String(stored.key ||"").trim();
 if (!key) return {ok:false,active:false,error:context.incognito?"INCOGNITO_LICENSE_REQUIRED":"LICENSE_REQUIRED",incognito:!!context.incognito};
 const cache = stored.cache;
 const securityLock=await getSecurityLock();
-if (!force && !securityLock?.locked && cache?.active && Date.now()-Number(cache.checkedAt||0) < 30*1000) return {...cache.result,incognito:!!context.incognito};
-const result = await licenseRequest(config,"status",{license_key:key},context);
+if (!force && !securityLock?.locked && cache?.active && cache.result?.provider==="happy-little101" && Date.now()-Number(cache.checkedAt||0) < 30*1000) return {...cache.result,incognito:!!context.incognito};
+const result = await happyLicenseRequest("check",key,context);
 if (result?.ok && result?.active) {
 await clearSecurityLock();
 result.capabilities=result.capabilities||licenseCapabilities(result.role);
-await syncGithubOAuthClientIdFromLicense(result);
 await persistLicenseCache(context,result);
-if(result?.runtime_lease) await persistRuntimeLease(context,result).catch(()=>null);
+await clearRuntimeLease(context);
 } else {
 await clearLicenseCache(context);
 await clearRuntimeLease(context).catch(()=>null);
@@ -1168,7 +1190,7 @@ async function recordLicensedUsage(config, provider, estimatedCredits=1, context
 const status = await getLicenseStatus(config,{force:false,context});
 if (!status?.ok || !status?.active) return status;
 const credits=Math.max(0.01,Math.min(1000,Number(estimatedCredits||1)));
-return licenseRequest(config,"usage",{provider:String(provider||"unknown").slice(0,40),estimated_credits:credits},context);
+return legacyLicenseAuxRequest(config,"usage",{provider:String(provider||"unknown").slice(0,40),estimated_credits:credits},context);
 }
 
 const BROKER_JOB_PREFIX="unstoppableBrokerJobV281:";
